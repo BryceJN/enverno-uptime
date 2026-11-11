@@ -1,0 +1,70 @@
+# Is the hub up? An outside check: the hub can't report its own death.
+#
+# Every 5 minutes this asks both addresses for /api/v1/health and wants HTTP 200 with "ok": true. One that
+# fails is asked once more 30 seconds later; only a second failure counts as down. Then one issue titled
+# "Hub is down" is opened in this repo (or, if it's already open, its text is updated, so you aren't emailed
+# every few minutes), and the run fails. When both answer again, the issue is closed with a comment. GitHub
+# emails the repo owner about the new issue and the closing comment. No secrets, no outside service.
+# This repo is public so the runs are free; it holds nothing but this file.
+name: Uptime
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Ask both addresses (again after 30 seconds before calling one down)
+        id: check
+        shell: bash
+        run: |
+          ok() {
+            local out code body
+            out=$(curl -sS --max-time 15 -w $'\n%{http_code}' "$1" 2>/dev/null) || return 1
+            code=${out##*$'\n'}
+            body=${out%$'\n'*}
+            [ "$code" = "200" ] && printf '%s' "$body" | jq -e '.ok == true' >/dev/null 2>&1
+          }
+          down=""
+          for url in https://portal.enverno.com/api/v1/health https://enverno-hub.fly.dev/api/v1/health; do
+            if ok "$url"; then echo "up: $url"; continue; fi
+            echo "no answer from $url; asking again in 30 seconds"
+            sleep 30
+            if ok "$url"; then echo "up on the second ask: $url"; continue; fi
+            echo "down: $url"
+            down="$down $url"
+          done
+          echo "down=${down# }" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update "Hub is down", or close it once the hub is back
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOWN: ${{ steps.check.outputs.down }}
+        run: |
+          title="Hub is down"
+          n=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number,title --jq "[.[] | select(.title == \"$title\")][0].number // empty")
+          now=$(date -u '+%Y-%m-%d %H:%M UTC')
+          if [ -n "$DOWN" ]; then
+            body=$(printf 'Not answering 200 with "ok": true, twice, 30 seconds apart:\n\n%s\n\nLast checked %s by %s.\n\nWhat to do: check https://fly.io/apps/enverno-hub/monitoring, then the hub repo docs/alerts.md, "The hub is down".' "$(printf -- '- %s\n' $DOWN)" "$now" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+            if [ -n "$n" ]; then
+              gh issue edit "$n" --repo "$GITHUB_REPOSITORY" --body "$body"
+            else
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            fi
+            exit 1
+          elif [ -n "$n" ]; then
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --comment "Back up at $now: both addresses answer 200 with \"ok\": true."
+          fi
